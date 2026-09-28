@@ -3127,6 +3127,16 @@ CREATE TABLE `PREFIX_csp_log` (
   PRIMARY KEY (`id_csp_log`)
 ) ENGINE=ENGINE_TYPE DEFAULT CHARSET=utf8mb4 COLLATION;
 
+CREATE TABLE `PREFIX_csp_rule` (
+  `id_csp_rule`  INT UNSIGNED AUTO_INCREMENT NOT NULL,
+  `id_shop`      INT UNSIGNED               NOT NULL,
+  `directive`    VARCHAR(64)                NOT NULL,
+  `source`       VARCHAR(255)               NOT NULL,
+  `date_add`     DATETIME                   NOT NULL,
+  UNIQUE INDEX `csp_rule_shop_directive_source_idx` (`id_shop`, `directive`, `source`),
+  PRIMARY KEY (`id_csp_rule`)
+) ENGINE=ENGINE_TYPE DEFAULT CHARSET=utf8mb4 COLLATION;
+
 CREATE TABLE `PREFIX_stock_mvt` (
   `id_stock_mvt`        BIGINT AUTO_INCREMENT NOT NULL,
   `id_stock`            INT                      NOT NULL,
