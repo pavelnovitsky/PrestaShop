@@ -12,6 +12,7 @@ use DateTimeImmutable;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\ORM\EntityRepository;
 use PrestaShopBundle\Entity\CspLog;
+use PrestaShopBundle\Entity\CspRule;
 
 /**
  * @extends EntityRepository<CspLog>
@@ -19,15 +20,10 @@ use PrestaShopBundle\Entity\CspLog;
 class CspLogRepository extends EntityRepository
 {
     /**
-     * Records one violation for (shop, directive, source): inserts the row on first sight,
-     * otherwise increments its hit counter and refreshes date_upd.
+     * Records one violation for (shop, directive, source): inserts on first sight, else bumps hits/date_upd.
+     * Uses INSERT ... ON DUPLICATE KEY UPDATE since a SELECT-then-write races under a flood (MySQL/MariaDB-specific).
      *
-     * A single INSERT ... ON DUPLICATE KEY UPDATE is used deliberately: the DBAL QueryBuilder
-     * cannot express it, and a SELECT-then-INSERT/UPDATE would race under a report flood.
-     * Precedent for a DBAL executeStatement() upsert: src/Core/ExtraProperty/Value/ExtraPropertyWriter.php.
-     *
-     * @return bool true when a new row was inserted, false when an existing row's hit counter was
-     *              bumped — so the caller only pays for the row-cap COUNT when the table actually grew
+     * @return bool true on insert, false when an existing row was bumped, so a batch caller can skip the row-cap COUNT
      */
     public function upsert(int $shopId, string $directive, string $source, ?string $documentUri): bool
     {
@@ -48,8 +44,27 @@ class CspLogRepository extends EntityRepository
             'dateUpdOnDuplicate' => $now,
         ]);
 
-        // MySQL returns 1 affected row for a fresh INSERT and 2 when ON DUPLICATE KEY UPDATE fires.
+        // MySQL returns 1 affected row for a fresh INSERT, 2 when ON DUPLICATE KEY UPDATE fires.
         return 1 === $affectedRows;
+    }
+
+    /** Seeds a log row (hits = 0) for a directly-added source so it shows in the log-driven grid; a no-op if a row exists. */
+    public function insertPlaceholderIfAbsent(int $shopId, string $directive, string $source): void
+    {
+        $table = $this->getClassMetadata()->getTableName();
+        $now = (new DateTimeImmutable())->format('Y-m-d H:i:s');
+
+        $sql = 'INSERT INTO ' . $table . ' (id_shop, directive, source, document_uri, hits, date_add, date_upd)'
+            . ' VALUES (:shopId, :directive, :source, NULL, 0, :dateAdd, :dateUpd)'
+            . ' ON DUPLICATE KEY UPDATE id_csp_log = id_csp_log';
+
+        $this->getEntityManager()->getConnection()->executeStatement($sql, [
+            'shopId' => $shopId,
+            'directive' => $directive,
+            'source' => $source,
+            'dateAdd' => $now,
+            'dateUpd' => $now,
+        ]);
     }
 
     public function countByShop(int $shopId): int
@@ -63,15 +78,7 @@ class CspLogRepository extends EntityRepository
             ->fetchOne();
     }
 
-    /**
-     * Prunes the least significant rows of a shop, keeping the table bounded. Returns the number of
-     * rows removed.
-     *
-     * Rows are ordered by hit count first, then by last-seen date, so the single-hit noise a report
-     * flood produces is evicted before a source the storefront reports repeatedly. This stops an
-     * unauthenticated flood of distinct made-up hosts from pushing the merchant's real, recurring
-     * violations out of the capped log.
-     */
+    /** Prunes a shop's lowest-hit, oldest rows to keep the table bounded; allow-list-backed rows are never evicted. Returns the count removed. */
     public function deleteLeastReportedByShop(int $shopId, int $limit): int
     {
         if ($limit <= 0) {
@@ -80,14 +87,17 @@ class CspLogRepository extends EntityRepository
 
         $connection = $this->getEntityManager()->getConnection();
         $table = $this->getClassMetadata()->getTableName();
+        $ruleTable = $this->getEntityManager()->getClassMetadata(CspRule::class)->getTableName();
 
         $ids = $connection->createQueryBuilder()
-            ->select('id_csp_log')
-            ->from($table)
-            ->where('id_shop = :shopId')
-            ->orderBy('hits', 'ASC')
-            ->addOrderBy('date_upd', 'ASC')
-            ->addOrderBy('id_csp_log', 'ASC')
+            ->select('l.id_csp_log')
+            ->from($table, 'l')
+            ->leftJoin('l', $ruleTable, 'r', 'r.id_shop = l.id_shop AND r.directive = l.directive AND r.source = l.source')
+            ->where('l.id_shop = :shopId')
+            ->andWhere('r.id_csp_rule IS NULL')
+            ->orderBy('l.hits', 'ASC')
+            ->addOrderBy('l.date_upd', 'ASC')
+            ->addOrderBy('l.id_csp_log', 'ASC')
             ->setMaxResults($limit)
             ->setParameter('shopId', $shopId)
             ->executeQuery()
@@ -104,15 +114,31 @@ class CspLogRepository extends EntityRepository
             ->executeStatement();
     }
 
-    /**
-     * Clears the whole log of one shop. Returns the number of rows removed.
-     */
+    /** Clears a shop's violation log but keeps rows backed by an allow-list rule, so curated rules stay in the grid. Returns the count removed. */
     public function deleteByShop(int $shopId): int
     {
-        return (int) $this->getEntityManager()->getConnection()->createQueryBuilder()
-            ->delete($this->getClassMetadata()->getTableName())
-            ->where('id_shop = :shopId')
+        $connection = $this->getEntityManager()->getConnection();
+        $table = $this->getClassMetadata()->getTableName();
+        $ruleTable = $this->getEntityManager()->getClassMetadata(CspRule::class)->getTableName();
+
+        $ids = $connection->createQueryBuilder()
+            ->select('l.id_csp_log')
+            ->from($table, 'l')
+            ->leftJoin('l', $ruleTable, 'r', 'r.id_shop = l.id_shop AND r.directive = l.directive AND r.source = l.source')
+            ->where('l.id_shop = :shopId')
+            ->andWhere('r.id_csp_rule IS NULL')
             ->setParameter('shopId', $shopId)
+            ->executeQuery()
+            ->fetchFirstColumn();
+
+        if (empty($ids)) {
+            return 0;
+        }
+
+        return (int) $connection->createQueryBuilder()
+            ->delete($table)
+            ->where('id_csp_log IN (:ids)')
+            ->setParameter('ids', $ids, ArrayParameterType::INTEGER)
             ->executeStatement();
     }
 }
