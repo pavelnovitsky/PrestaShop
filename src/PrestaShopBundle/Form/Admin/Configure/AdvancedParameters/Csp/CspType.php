@@ -14,11 +14,8 @@ use PrestaShopBundle\Form\Admin\Type\TranslatorAwareType;
 use Symfony\Component\Form\FormBuilderInterface;
 use Symfony\Component\OptionsResolver\OptionsResolver;
 
-/**
- * Generates the settings block of the
- * "Advanced parameters > Security > Content Security Policy" page.
- */
-class CspType extends TranslatorAwareType
+/** Settings block of the "Advanced parameters > Security > Content Security Policy" page. */
+final class CspType extends TranslatorAwareType
 {
     /**
      * {@inheritdoc}
@@ -36,7 +33,7 @@ class CspType extends TranslatorAwareType
                 'required' => false,
                 'multistore_configuration_key' => 'PS_CSP_REPORT_ONLY',
                 'label' => $this->trans('Report-only mode', 'Admin.Advparameters.Feature'),
-                'help' => $this->trans('Only report violations without blocking anything. Keep this on until your allow-list is complete.', 'Admin.Advparameters.Help'),
+                'help' => $this->trans('On: violations are reported but nothing is blocked. Off: the policy is enforced and any source that is not on your allow-list is blocked in visitors\' browsers. Turn this off only once the allow-list is complete, or the storefront may break.', 'Admin.Advparameters.Help'),
             ]);
     }
 
