@@ -29,6 +29,9 @@ function setFeatureFlag(featureFlag: string, expectedStatus: boolean, baseContex
     case boFeatureFlagPage.featureFlagDiscount:
       title = 'Discount';
       break;
+    case boFeatureFlagPage.featureFlagCsp:
+      title = 'Content Security Policy';
+      break;
     case boFeatureFlagPage.featureFlagExperimentalEndpoints:
       title = 'Admin API - Enable experimental endpoints';
       break;
