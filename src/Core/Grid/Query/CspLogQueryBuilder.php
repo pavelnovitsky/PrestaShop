@@ -8,23 +8,27 @@ declare(strict_types=1);
 
 namespace PrestaShop\PrestaShop\Core\Grid\Query;
 
+use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Query\QueryBuilder;
+use PrestaShop\PrestaShop\Core\Domain\Csp\ValueObject\CspDirective;
+use PrestaShop\PrestaShop\Core\Domain\Csp\ValueObject\CspLogStatusFilter;
+use PrestaShop\PrestaShop\Core\Domain\Csp\ValueObject\CspSource;
 use PrestaShop\PrestaShop\Core\Grid\Search\SearchCriteriaInterface;
 use PrestaShop\PrestaShop\Core\Grid\Search\ShopSearchCriteriaInterface;
 use PrestaShop\PrestaShop\Core\Shop\ShopListResolverInterface;
 
 /**
- * Builds search and count queries for the CSP violation log grid.
- *
- * Rows are always scoped to the shops carried by the search criteria's ShopConstraint, so a shop
- * never sees another shop's collected violations.
+ * Builds search and count queries for the CSP violation log grid, scoped to the criteria's ShopConstraint.
+ * A LEFT JOIN on csp_rule tells whether each reported source is already on the shop's allow-list.
  */
 final class CspLogQueryBuilder extends AbstractDoctrineQueryBuilder
 {
     private const TEXT_FILTERS = ['directive', 'source'];
 
-    private string $cspLogTable;
+    private readonly string $cspLogTable;
+
+    private readonly string $cspRuleTable;
 
     public function __construct(
         Connection $connection,
@@ -34,12 +38,32 @@ final class CspLogQueryBuilder extends AbstractDoctrineQueryBuilder
     ) {
         parent::__construct($connection, $dbPrefix);
         $this->cspLogTable = $dbPrefix . 'csp_log';
+        $this->cspRuleTable = $dbPrefix . 'csp_rule';
     }
 
     public function getSearchQueryBuilder(SearchCriteriaInterface $searchCriteria): QueryBuilder
     {
         $qb = $this->buildBaseQuery($searchCriteria);
-        $qb->select('c.id_csp_log', 'c.directive', 'c.source', 'c.document_uri', 'c.hits', 'c.date_add');
+        $qb->select(
+            'c.id_csp_log',
+            'c.directive',
+            'c.source',
+            'c.document_uri',
+            'c.hits',
+            'c.date_add',
+            'r.id_csp_rule',
+            'IF(r.id_csp_rule IS NULL, 0, 1) AS is_allowed',
+            // Drives the bulk-action disabled_field: an un-allowed row has no rule to revoke.
+            'IF(r.id_csp_rule IS NULL, 1, 0) AS is_not_allowed',
+            // Weakening sources get the confirm-gated "Allow" action:
+            // weakening keyword/wildcard, wildcard host, or broad scheme on script-/style-src.
+            'IF(c.source IN (:weakeningSources)'
+                . " OR c.source LIKE '%*%'"
+                . ' OR (c.directive IN (:scriptStyleDirectives) AND c.source IN (:broadeningSchemes)), 1, 0) AS is_weakening'
+        );
+        $qb->setParameter('weakeningSources', CspSource::WEAKENING_KEYWORDS, ArrayParameterType::STRING);
+        $qb->setParameter('scriptStyleDirectives', [CspDirective::SCRIPT_SRC->value, CspDirective::STYLE_SRC->value], ArrayParameterType::STRING);
+        $qb->setParameter('broadeningSchemes', CspSource::BROADENING_SCHEMES, ArrayParameterType::STRING);
 
         $this->searchCriteriaApplicator
             ->applySorting($searchCriteria, $qb)
@@ -56,7 +80,9 @@ final class CspLogQueryBuilder extends AbstractDoctrineQueryBuilder
 
     private function buildBaseQuery(SearchCriteriaInterface $searchCriteria): QueryBuilder
     {
-        $qb = $this->connection->createQueryBuilder()->from($this->cspLogTable, 'c');
+        $qb = $this->connection->createQueryBuilder()
+            ->from($this->cspLogTable, 'c')
+            ->leftJoin('c', $this->cspRuleTable, 'r', 'r.id_shop = c.id_shop AND r.directive = c.directive AND r.source = c.source');
 
         $this->applyShopRestriction($qb, $searchCriteria);
 
@@ -68,10 +94,27 @@ final class CspLogQueryBuilder extends AbstractDoctrineQueryBuilder
             if (in_array($filterName, self::TEXT_FILTERS, true)) {
                 $qb->andWhere(sprintf('c.%s LIKE :%s', $filterName, $filterName));
                 $qb->setParameter($filterName, '%' . $value . '%');
+
+                continue;
+            }
+
+            if ('status' === $filterName) {
+                $this->applyStatusFilter($qb, (string) $value);
             }
         }
 
         return $qb;
+    }
+
+    private function applyStatusFilter(QueryBuilder $qb, string $status): void
+    {
+        $statusFilter = CspLogStatusFilter::tryFrom($status);
+
+        if (CspLogStatusFilter::ALLOWED === $statusFilter) {
+            $qb->andWhere('r.id_csp_rule IS NOT NULL');
+        } elseif (CspLogStatusFilter::VIOLATIONS === $statusFilter) {
+            $qb->andWhere('r.id_csp_rule IS NULL');
+        }
     }
 
     private function applyShopRestriction(QueryBuilder $qb, SearchCriteriaInterface $searchCriteria): void
@@ -87,6 +130,6 @@ final class CspLogQueryBuilder extends AbstractDoctrineQueryBuilder
         }
 
         $qb->andWhere('c.id_shop IN (:shopIds)');
-        $qb->setParameter('shopIds', $shopIds, Connection::PARAM_INT_ARRAY);
+        $qb->setParameter('shopIds', $shopIds, ArrayParameterType::INTEGER);
     }
 }
